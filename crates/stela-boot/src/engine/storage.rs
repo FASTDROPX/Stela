@@ -2184,6 +2184,7 @@ pub unsafe fn open(
         core::mem::take(&mut devices.usb_hosts),
         core::mem::take(&mut devices.usb4_hosts),
         core::mem::take(&mut devices.usb_storage),
+        core::mem::take(&mut devices.audio),
         dma,
         firmware,
         root,

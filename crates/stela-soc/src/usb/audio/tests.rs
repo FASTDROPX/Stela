@@ -261,6 +261,7 @@ fn a_uac2_host_driver_plays_through_the_isochronous_endpoint() {
             pcm.extend_from_slice(&value.to_le_bytes()[..subslot]);
         }
         audio.start_playback(index, RATE, &pcm, true).unwrap();
+        assert_eq!(audio.buffered_playback_frames(), frames);
         let mut drained = false;
         for _ in 0..20_000 {
             if audio.poll().unwrap().playback_drained {
@@ -269,6 +270,7 @@ fn a_uac2_host_driver_plays_through_the_isochronous_endpoint() {
             }
         }
         assert!(drained, "{:?}", audio.progress());
+        assert_eq!(audio.buffered_playback_frames(), 0);
         let model = &mut bench.model.borrow_mut().function.ports.0;
         // A finite stream ends by selecting the zero-bandwidth setting.
         assert!(!model.streaming());

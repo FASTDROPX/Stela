@@ -1108,6 +1108,13 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             sep_state,
             board_flash,
             rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
+            guest_audio: options.boots_macos()
+                && host_usb.as_ref().is_some_and(usb::HostUsb::has_audio)
+                && usb_disks.len()
+                    < stela_soc::machine::UsbCables::disk_ports(
+                        guest_network.is_some(),
+                        host_bluetooth.is_some(),
+                    ),
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
@@ -1660,6 +1667,7 @@ struct Placement<'a> {
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
+    guest_audio: bool,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -1798,6 +1806,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                audio: placement.guest_audio,
             },
             scanout,
             firmware: &firmware,
