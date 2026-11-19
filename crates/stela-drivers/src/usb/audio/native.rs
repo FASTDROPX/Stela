@@ -10,7 +10,7 @@ use crate::{
     usb::descriptor::Endpoint,
     usb::xhci::{Device, IsoStatus, IsoTransfer, Shared, SlotId},
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 struct DiscoveryControl<'a> {
     shared: &'a Shared,
@@ -81,6 +81,7 @@ impl Arena {
 pub struct Native {
     shared: Shared,
     id: SlotId,
+    name: Option<String>,
     time: NativeTime,
     playback: Arena,
     capture: Arena,
@@ -211,6 +212,10 @@ impl Transport for Native {
 /// Native playback/capture owner published by xHCI and kept in probe::Devices.
 pub type UsbAudio = AudioDevice<Native>;
 impl UsbAudio {
+    pub fn product_name(&self) -> Option<&str> {
+        self.transport.name.as_deref()
+    }
+
     pub(crate) fn attach(
         shared: Shared,
         device: &Device,
@@ -237,6 +242,12 @@ impl UsbAudio {
         let native = Native {
             shared,
             id: device.id,
+            name: device
+                .product
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(String::from),
             time,
             playback: Arena::new(dma)?,
             capture: Arena::new(dma)?,
@@ -342,6 +353,7 @@ pub(crate) mod tests {
             let mut native = Native {
                 shared: shared.clone(),
                 id: shared.borrow().test_device_id(1).unwrap(),
+                name: None,
                 time: NativeTime::new(shared.borrow().clock).unwrap(),
                 playback: Arena::new(&mut dma).unwrap(),
                 capture: Arena::new(&mut dma).unwrap(),

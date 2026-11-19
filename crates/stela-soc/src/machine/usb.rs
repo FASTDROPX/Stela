@@ -160,8 +160,9 @@ impl AppleDevices {
             bluetooth,
             audio,
         } = cables;
-        let extras =
-            usize::from(network.is_some()) + usize::from(bluetooth.is_some()) + usize::from(audio);
+        let extras = usize::from(network.is_some())
+            + usize::from(bluetooth.is_some())
+            + usize::from(audio.is_some());
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -184,7 +185,7 @@ impl AppleDevices {
                 UsbBluetooth::Host => Hci::new(),
                 UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
             }),
-            audio: audio.then(crate::usb::audio::Audio::new),
+            audio: audio.map(crate::usb::audio::Audio::named),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);

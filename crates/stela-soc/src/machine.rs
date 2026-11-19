@@ -389,8 +389,8 @@ pub struct UsbCables {
     pub network: Option<Mac>,
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,
-    /// A USB Audio Class speaker backed by the host's audio service.
-    pub audio: bool,
+    /// The product name of a USB Audio Class speaker backed by host audio.
+    pub audio: Option<alloc::string::String>,
 }
 
 /// The USB Bluetooth controller on the native hub.

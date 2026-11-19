@@ -225,8 +225,8 @@ impl HostUsb {
         }
     }
 
-    pub(super) fn has_audio(&self) -> bool {
-        self.audio.is_some()
+    pub(super) fn audio_name(&self) -> Option<&str> {
+        self.audio.as_ref().map(playback::Playback::guest_name)
     }
 
     pub(super) fn step_audio(&mut self, board: &super::parallel::Board, boot: bool) {

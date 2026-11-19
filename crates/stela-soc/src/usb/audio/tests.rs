@@ -35,6 +35,24 @@ fn stream(a: &mut Audio, alternate: u16) {
 }
 
 #[test]
+fn named_speaker_publishes_the_physical_product_string() {
+    let name = "FIFINE Headset";
+    let mut audio = Audio::named(name.into());
+    let descriptor = transfer(
+        &mut audio,
+        setup(0x80, GET_DESCRIPTOR, 0x0302, 0x0409, 255),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(descriptor[1], 3);
+    let text: Vec<_> = descriptor[2..]
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect();
+    assert!(text.into_iter().eq(name.encode_utf16()));
+}
+
+#[test]
 fn descriptors_describe_one_stereo_uac2_output_without_capture() {
     let mut a = configured();
     let config = transfer(&mut a, setup(0x80, GET_DESCRIPTOR, 0x200, 0, 512), &[]).unwrap();

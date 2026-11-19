@@ -99,7 +99,7 @@ pub struct Progress {
 }
 
 pub struct AudioDevice<T: Transport> {
-    transport: T,
+    pub(super) transport: T,
     binding: Binding,
     output: Lane<T::Ticket>,
     input: Lane<T::Ticket>,

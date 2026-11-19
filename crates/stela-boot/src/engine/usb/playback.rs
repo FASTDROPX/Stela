@@ -1,7 +1,7 @@
-//! Moves bounded batches from the guest UAC2 speaker to one physical USB DAC.
+//! Moves bounded batches from the guest UAC2 speaker to an available USB DAC.
 use super::{RestoreRoot, output};
 use crate::engine::{host, parallel::Board};
-use alloc::{vec, vec::Vec};
+use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use stela_boot_core::audio_pcm::Pcm;
 use stela_drivers::{
@@ -26,56 +26,74 @@ pub(in crate::engine) fn due() -> bool {
 }
 
 pub(super) struct Playback {
-    device: UsbAudio,
-    alternate: usize,
-    format: Pcm,
+    outputs: VecDeque<Output>,
     samples: Vec<[i32; 2]>,
     pcm: Vec<u8>,
     pending: usize,
     running: bool,
-    failed: bool,
     next: u64,
     corrected: u64,
     underruns: u64,
     reported: bool,
 }
 
-impl Playback {
-    /// Called while the host driver root is active, so unused owners drop
-    /// with their controller and DMA storage mapped.
-    pub(super) fn select(devices: Vec<UsbAudio>) -> Option<Self> {
-        for device in devices {
-            let formats = &device.binding().formats;
-            for (format, bits) in [(Pcm::I16, 16), (Pcm::I24, 24)] {
-                let alternate = formats.iter().position(|f| {
-                    f.direction == Direction::Playback
-                        && f.channels == 2
-                        && f.bits == bits
-                        && usize::from(f.subslot) == format.sample_bytes()
-                        && f.power_domain.is_none()
-                        && f.endpoint_rates.as_ref().is_none_or(|rates| {
-                            rates.ranges.iter().any(|range| range.contains(RATE))
-                        })
+struct Output {
+    device: UsbAudio,
+    alternate: usize,
+    format: Pcm,
+}
+
+impl Output {
+    fn of(device: UsbAudio) -> Option<Self> {
+        let formats = &device.binding().formats;
+        for (format, bits) in [(Pcm::I16, 16), (Pcm::I24, 24)] {
+            let alternate = formats.iter().position(|f| {
+                f.direction == Direction::Playback
+                    && f.channels == 2
+                    && f.bits == bits
+                    && usize::from(f.subslot) == format.sample_bytes()
+                    && f.power_domain.is_none()
+                    && f.endpoint_rates
+                        .as_ref()
+                        .is_none_or(|rates| rates.ranges.iter().any(|range| range.contains(RATE)))
+            });
+            if let Some(alternate) = alternate {
+                return Some(Self {
+                    device,
+                    alternate,
+                    format,
                 });
-                if let Some(alternate) = alternate {
-                    return Some(Self {
-                        device,
-                        alternate,
-                        format,
-                        samples: vec![[0; 2]; TARGET + 1],
-                        pcm: vec![0; MAX_PCM],
-                        pending: 0,
-                        running: false,
-                        failed: false,
-                        next: 0,
-                        corrected: 0,
-                        underruns: 0,
-                        reported: false,
-                    });
-                }
             }
         }
         None
+    }
+}
+
+impl Playback {
+    /// Called while the host driver root is active, so incompatible owners
+    /// drop with their controller and DMA storage mapped.
+    pub(super) fn select(devices: Vec<UsbAudio>) -> Option<Self> {
+        let outputs: VecDeque<_> = devices.into_iter().filter_map(Output::of).collect();
+        (!outputs.is_empty()).then(|| Self {
+            outputs,
+            samples: vec![[0; 2]; TARGET + 1],
+            pcm: vec![0; MAX_PCM],
+            pending: 0,
+            running: false,
+            next: 0,
+            corrected: 0,
+            underruns: 0,
+            reported: false,
+        })
+    }
+
+    pub(super) fn guest_name(&self) -> &str {
+        if self.outputs.len() == 1
+            && let Some(name) = self.outputs[0].device.product_name()
+        {
+            return name;
+        }
+        stela_soc::usb::audio::DEFAULT_NAME
     }
 
     fn again(&mut self, now: u64, millis: u64) {
@@ -85,10 +103,13 @@ impl Playback {
 
     pub(super) fn step(&mut self, root: u64, board: &Board, boot: bool) {
         let now = host::fresh_counter();
-        if self.failed || now < self.next {
+        if now < self.next {
             return;
         }
-        let buffered = self.device.buffered_playback_frames();
+        let Some(output) = self.outputs.front_mut() else {
+            return;
+        };
+        let buffered = output.device.buffered_playback_frames();
         let Some(active) = board.try_with(|board| {
             let speaker = board.usb_audio()?;
             if !speaker.streaming() {
@@ -124,13 +145,13 @@ impl Playback {
             if stretch {
                 self.corrected = now;
             }
-            let output = if !self.running || buffered < LOW || stretch {
+            let rendered = if !self.running || buffered < LOW || stretch {
                 frames
             } else {
                 consumed.min(frames)
             };
-            self.pending = output * 2 * self.format.sample_bytes();
-            self.format.render(
+            self.pending = rendered * 2 * output.format.sample_bytes();
+            output.format.render(
                 &self.samples[..consumed],
                 &mut self.pcm[..self.pending],
                 stretch,
@@ -159,27 +180,45 @@ impl Playback {
         };
         let result = if !active {
             self.running = false;
-            self.device.stop_playback()
+            output.device.stop_playback()
         } else if !self.running {
-            let result =
-                self.device
-                    .start_playback(self.alternate, RATE, &self.pcm[..self.pending], false);
+            let result = output.device.start_playback(
+                output.alternate,
+                RATE,
+                &self.pcm[..self.pending],
+                false,
+            );
             self.running = result.is_ok();
             result
         } else {
-            self.device
+            output
+                .device
                 .write_playback(&self.pcm[..self.pending])
-                .and_then(|()| self.device.poll().map(|_| ()))
+                .and_then(|()| output.device.poll().map(|_| ()))
         };
-        drop(root_guard);
         self.pending = 0;
+        let bits = output.format.sample_bytes() * 8;
+        let failed = !matches!(result, Ok(()) | Err(Error::Underrun));
+        let name = (failed || (self.running && !self.reported))
+            .then(|| output.device.product_name())
+            .flatten()
+            .map(alloc::string::String::from);
+        if failed {
+            // Owners may need mapped controller registers while dropping.
+            drop(self.outputs.pop_front());
+            self.running = false;
+            self.corrected = 0;
+            self.underruns = 0;
+            self.reported = false;
+        }
+        drop(root_guard);
+        let name = name.as_deref().unwrap_or("USB audio");
         match result {
             Ok(()) => {
                 if self.running && !self.reported {
                     self.reported = true;
                     output::arguments(format_args!(
-                        "AUDIO USB playback started rate={RATE} bits={} channels=2\n",
-                        self.format.sample_bytes() * 8,
+                        "AUDIO USB playback started rate={RATE} bits={bits} channels=2 device={name:?}\n",
                     ));
                 }
                 self.again(now, if self.running { 2 } else { 20 });
@@ -197,24 +236,30 @@ impl Playback {
                 self.again(now, 10);
             }
             Err(error) => {
-                self.failed = true;
-                NEXT.store(0, Ordering::Relaxed);
-                output::arguments(format_args!("AUDIO USB playback unavailable: {error:?}\n"));
+                output::arguments(format_args!(
+                    "AUDIO USB playback unavailable device={name:?}: {error:?}\n"
+                ));
+                self.again(now, 4);
             }
         }
     }
 
     pub(super) fn stop(&mut self, root: u64) {
         NEXT.store(0, Ordering::Relaxed);
-        self.failed = true;
-        if self.running {
-            // SAFETY: the service is stopping, with no host driver guard held
-            // and the same live loader root as its normal work.
-            let _root = unsafe { RestoreRoot::enter(root) };
-            if let Err(error) = self.device.stop_playback() {
+        if self.outputs.is_empty() {
+            return;
+        }
+        // SAFETY: the service is stopping, with no host driver guard held
+        // and the same live loader root as its normal work.
+        let _root = unsafe { RestoreRoot::enter(root) };
+        if self.running
+            && let Some(output) = self.outputs.front_mut()
+        {
+            if let Err(error) = output.device.stop_playback() {
                 output::arguments(format_args!("AUDIO USB playback stop: {error:?}\n"));
             }
-            self.running = false;
         }
+        self.outputs.clear();
+        self.running = false;
     }
 }

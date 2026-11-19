@@ -3813,7 +3813,7 @@ fn native_usb_hub_exposes_an_optional_audio_output() {
         .attach_input(
             placement.port,
             UsbCables {
-                audio: true,
+                audio: Some(crate::usb::audio::DEFAULT_NAME.into()),
                 ..UsbCables::default()
             },
         )

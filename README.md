@@ -41,9 +41,12 @@ and supports the Metal3 and Apple7 GPU families.
 ## USB audio playback
 
 Connect a USB DAC or headset before booting the installed macOS. It needs a
-48 kHz stereo output in 16-bit or packed 24-bit PCM. Select **Stela USB Audio**
-in macOS Sound settings. The virtual speaker needs a free port on Stela's
-guest USB hub. The log records playback start, underruns and device errors.
+48 kHz stereo output in 16-bit or packed 24-bit PCM. Select the device's name
+in macOS Sound settings, or **Stela USB Audio** when there are multiple
+compatible devices or the device has no product name. With multiple devices
+connected at boot, Stela uses the next compatible output if the current one
+fails. The virtual speaker needs a free port on Stela's guest USB hub. The log
+records the selected device, playback start, underruns and device errors.
 
 This implementation covers playback through USB. Microphone input, onboard
 audio, HDMI/DisplayPort audio and reconnecting the device after boot are
