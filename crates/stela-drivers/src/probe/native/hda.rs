@@ -3,8 +3,8 @@ use super::{Failure, NativeServices, ServiceError, map};
 use crate::{
     Clock,
     audio::{
-        self,
-        hda::{self, CodecFailure, CodecGraph, CodecSetup},
+        self, Direction, PcmFormat,
+        hda::{self, CodecFailure, CodecGraph, CodecSetup, PinDevice, PinOptions, StreamId},
     },
     bus::{
         mmio::{Mmio, owned::Mapping},
@@ -55,11 +55,108 @@ pub struct Codec {
 pub struct Host {
     pub location: String,
     owner: Native<Bar0, audio::Timing<Clock>>,
+    jack: Option<Jack>,
     pub codecs: Vec<Codec>,
     pub codec_failures: Vec<CodecFailure>,
     pub discovery_error: Option<audio::Error>,
 }
+
+struct Jack {
+    codec: usize,
+    pin: u8,
+    stream: StreamId,
+}
+
 impl Host {
+    pub fn prepare_jack(
+        &mut self,
+        format: PcmFormat,
+        period_bytes: usize,
+        periods: usize,
+    ) -> Result<bool, RetirementError> {
+        if self.jack.is_some() {
+            return self.jack_present();
+        }
+        for (codec, entry) in self
+            .codecs
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.setup.is_ok())
+        {
+            let route = self.owner.playback(|controller, dma| {
+                let Some(jack) = controller.connected_output_jack(&entry.graph, format)? else {
+                    return Ok(None);
+                };
+                let stream = controller.allocate_stream(
+                    Direction::Playback,
+                    format,
+                    period_bytes,
+                    periods,
+                    dma,
+                )?;
+                controller.configure_analog_route(
+                    &entry.graph,
+                    &jack.route,
+                    stream,
+                    0,
+                    PinOptions::Playback {
+                        headphone: jack.configuration.device() == PinDevice::Headphone,
+                        eapd: None,
+                    },
+                )?;
+                Ok(Some(Jack {
+                    codec,
+                    pin: jack.route.pin(),
+                    stream,
+                }))
+            })?;
+            if let Some(route) = route {
+                self.jack = Some(route);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn jack_present(&mut self) -> Result<bool, RetirementError> {
+        let Some(jack) = &self.jack else {
+            return Ok(false);
+        };
+        self.owner.playback(|controller, _| {
+            let sense = controller.poll_pin_sense(&self.codecs[jack.codec].graph, jack.pin)?;
+            Ok(sense.present && sense.raw != u32::MAX)
+        })
+    }
+
+    pub fn start_jack(&mut self, pcm: &[u8]) -> Result<(), RetirementError> {
+        let stream = self
+            .jack
+            .as_ref()
+            .ok_or(audio::Error::InvalidStream)?
+            .stream;
+        self.owner
+            .playback(|controller, _| controller.start_analog_playback(stream, pcm))
+    }
+
+    pub fn refill_jack(&mut self, pcm: &[u8]) -> Result<bool, RetirementError> {
+        let stream = self
+            .jack
+            .as_ref()
+            .ok_or(audio::Error::InvalidStream)?
+            .stream;
+        self.owner
+            .playback(|controller, _| Ok(controller.refill_analog_period(stream, pcm)?.is_some()))
+    }
+
+    pub fn stop_jack(&mut self) -> Result<(), RetirementError> {
+        let stream = self
+            .jack
+            .as_ref()
+            .ok_or(audio::Error::InvalidStream)?
+            .stream;
+        self.owner.playback(|controller, _| controller.stop(stream))
+    }
+
     /// Explicit one-shot hardware/root/lease/Attachment/mapping retirement.
     /// Failure and unwind keep the complete graph and permanently close entry.
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
@@ -174,6 +271,7 @@ pub(in crate::probe) unsafe fn attach(
     Ok(Host {
         location: alloc::format!("{address}"),
         owner,
+        jack: None,
         codecs: discovery.codecs,
         codec_failures: discovery.codec_failures,
         discovery_error: discovery.discovery_error,

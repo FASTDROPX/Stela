@@ -17,7 +17,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::mem::ManuallyDrop;
 mod chmap;
 mod eld;
-mod playback;
+pub(in crate::hda) mod playback;
 pub use chmap::{ChannelMap, Speaker};
 pub use eld::{AudioDescriptor, Connection, Eld};
 pub use playback::RefilledPeriod;

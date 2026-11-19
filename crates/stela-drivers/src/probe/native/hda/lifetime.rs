@@ -81,7 +81,7 @@ pub(super) struct Inputs<R, T> {
     pub bar: Bar,
     pub original_users: Option<OriginalUsers>,
 }
-struct Shared<R>(Rc<RefCell<R>>);
+pub(super) struct Shared<R>(Rc<RefCell<R>>);
 impl<R> Clone for Shared<R> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -361,6 +361,20 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             return Err(self.error.unwrap_or(Error::Terminal));
         }
         Ok(())
+    }
+    pub(super) fn playback<TOutput>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut Core<R, T>,
+            &mut DomainAllocator<'static>,
+        ) -> Result<TOutput, audio::Error>,
+    ) -> Result<TOutput, Error> {
+        self.admit()?;
+        let resources = self.owner.resources();
+        Ok(operation(
+            resources.controller.as_mut().unwrap(),
+            resources.dma.as_mut().unwrap(),
+        )?)
     }
     pub fn discover_and_setup(&mut self) -> Result<Discovery, Error> {
         self.admit()?;

@@ -7,6 +7,7 @@
 //! Copyright (c) 2004 Takashi Iwai <tiwai@suse.de>
 //!                     PeiSen Hou <pshou@realtek.com.tw>
 use super::super::{Direction, Error, PcmFormat, Phase};
+use super::hdmi::{RefilledPeriod, playback::Progress};
 use super::{CodecGraph, Controller, ControllerToken, Registers, Verb, WidgetKind, registers::*};
 use crate::Timer;
 use crate::bus::dma::{DmaAllocator, DmaBuffer};
@@ -116,6 +117,7 @@ pub(super) struct Stream {
     pub(super) bdl_entries: u16,
     pub(super) running: bool,
     pub(super) poisoned: bool,
+    analog_playback: Option<Progress>,
     fifo_insufficient: bool,
 }
 
@@ -183,8 +185,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// Periods must be frame-aligned multiples of 128 bytes. Entries are split
     /// at 4K boundaries, including controller families with that restriction.
     /// Max 256 entries and 4MiB cyclic buffers; bidirectional engines, non-PCM,
-    /// and scatter/gather external buffers are not provided here. The explicit
-    /// HDMI owner adds completed-period live playback refill separately.
+    /// and scatter/gather external buffers are not provided here.
     pub fn allocate_stream(
         &mut self,
         direction: Direction,
@@ -347,6 +348,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             bdl_entries: count as u16,
             running: false,
             poisoned: false,
+            analog_playback: None,
             fifo_insufficient: true,
         });
         Ok(id)
@@ -381,9 +383,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(self.stream(id)?.buffer.len())
     }
 
-    /// Direct PCM access requires a stopped stream. The explicit HDMI owner
-    /// supplies its separate completed-period playback refill API; generic
-    /// live capture consumption remains unsupported. LPIB alone grants no RAM.
+    /// Direct PCM access requires a stopped stream. Live playback uses the
+    /// corresponding completed-period refill API. LPIB alone grants no RAM.
     pub fn write_pcm(&mut self, id: StreamId, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         self.minimum_guard()?;
         let stream = self.stream(id)?;
@@ -492,12 +493,95 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.status(id).map(|_| ())
     }
 
+    /// Start a configured analog route with an entirely fresh ring.
+    /// The caller must service completed periods well before a full DMA lap.
+    pub fn start_analog_playback(&mut self, id: StreamId, pcm: &[u8]) -> Result<(), Error> {
+        let stream = self.stream(id)?;
+        if stream.direction != Direction::Playback
+            || stream.hdmi_required
+            || !self.routes.iter().any(|(owner, _)| *owner == id)
+        {
+            return Err(Error::UnsupportedTopology);
+        }
+        if pcm.len() != stream.buffer.len() {
+            return Err(Error::InvalidBuffer);
+        }
+        self.write_pcm(id, 0, pcm)?;
+        let progress = self.begin_period_playback(id)?;
+        self.streams[usize::from(id.index)]
+            .as_mut()
+            .unwrap()
+            .analog_playback = Some(progress);
+        if let Err(error) = self.start(id) {
+            if self.stream(id).is_ok_and(|stream| stream.running) {
+                let _ = self.stop(id);
+            }
+            self.streams[usize::from(id.index)]
+                .as_mut()
+                .unwrap()
+                .analog_playback = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Write one complete period after IOC and transport position confirm the
+    /// DMA engine released it, with the FIFO guard checked on both sides.
+    pub fn refill_analog_period(
+        &mut self,
+        id: StreamId,
+        pcm: &[u8],
+    ) -> Result<Option<RefilledPeriod>, Error> {
+        let stream = self.stream(id)?;
+        if !stream.running || stream.analog_playback.is_none() {
+            return Err(Error::StreamStopped);
+        }
+        if pcm.len() != stream.period_bytes {
+            return Err(Error::InvalidBuffer);
+        }
+        self.check_analog_playback(id)?;
+        let index = usize::from(id.index);
+        let progress = self.streams[index]
+            .as_ref()
+            .unwrap()
+            .analog_playback
+            .as_ref()
+            .unwrap();
+        let Some(refill) = progress.next_period()? else {
+            return Ok(None);
+        };
+        self.write_completed_period(id, refill.ring_offset, pcm);
+        self.check_analog_playback(id)?;
+        let progress = self.streams[index]
+            .as_mut()
+            .unwrap()
+            .analog_playback
+            .as_mut()
+            .unwrap();
+        if let Err(error) = progress.commit() {
+            let _ = self.stop(id);
+            return Err(error);
+        }
+        Ok(Some(refill))
+    }
+
+    fn check_analog_playback(&mut self, id: StreamId) -> Result<(), Error> {
+        if let Err(error) = self.status(id) {
+            if self.stream(id).is_ok_and(|stream| stream.running) {
+                let _ = self.stop(id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn stop(&mut self, id: StreamId) -> Result<(), Error> {
         self.minimum_guard()?;
         self.stream(id)?;
         let result = self.stop_descriptor(id.index);
         let stream = self.streams[usize::from(id.index)].as_mut().unwrap();
         stream.running = false;
+        stream.analog_playback = None;
         if result.is_err() {
             stream.poisoned = true;
         }
@@ -519,6 +603,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             let _ = self.stop_descriptor(id.index);
             let stream = self.streams[usize::from(id.index)].as_mut().unwrap();
             stream.running = false;
+            stream.analog_playback = None;
             stream.poisoned = true;
             let error = Error::StreamDma { status };
             if let Some(index) = self.hdmi_stream_port(id) {
@@ -529,7 +614,19 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let position = self.position_info(id)?;
         self.registers.write8(base + SD_STS, status & SD_COMPLETE);
         if running {
-            self.hdmi_progress(id, position.transport_bytes, status & SD_COMPLETE != 0)?;
+            let completed = status & SD_COMPLETE != 0;
+            if let Some(progress) = self.streams[usize::from(id.index)]
+                .as_mut()
+                .unwrap()
+                .analog_playback
+                .as_mut()
+                && let Err(error) =
+                    progress.observe(position.transport_bytes, completed, self.timer.now_us())
+            {
+                let _ = self.stop(id);
+                return Err(error);
+            }
+            self.hdmi_progress(id, position.transport_bytes, completed)?;
         }
         Ok(StreamStatus {
             running,

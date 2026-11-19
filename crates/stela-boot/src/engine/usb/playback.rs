@@ -6,9 +6,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use stela_boot_core::audio_pcm::Pcm;
 use stela_drivers::{
     audio::Direction,
+    probe::native::hda::Host as HdaHost,
     usb::audio::{Error, UsbAudio},
 };
 use stela_soc::usb::audio::RATE;
+mod jack;
+use jack::JackPlayback;
 
 const FRAMES_PER_MS: usize = RATE as usize / 1000;
 const TARGET: usize = 40 * FRAMES_PER_MS;
@@ -26,6 +29,7 @@ pub(in crate::engine) fn due() -> bool {
 }
 
 pub(super) struct Playback {
+    jack: Option<JackPlayback>,
     outputs: VecDeque<Output>,
     samples: Vec<[i32; 2]>,
     pcm: Vec<u8>,
@@ -72,9 +76,11 @@ impl Output {
 impl Playback {
     /// Called while the host driver root is active, so incompatible owners
     /// drop with their controller and DMA storage mapped.
-    pub(super) fn select(devices: Vec<UsbAudio>) -> Option<Self> {
+    pub(super) fn select(devices: Vec<UsbAudio>, hda: Vec<HdaHost>) -> Option<Self> {
         let outputs: VecDeque<_> = devices.into_iter().filter_map(Output::of).collect();
-        (!outputs.is_empty()).then(|| Self {
+        let jack = JackPlayback::select(hda);
+        (jack.is_some() || !outputs.is_empty()).then(|| Self {
+            jack,
             outputs,
             samples: vec![[0; 2]; TARGET + 1],
             pcm: vec![0; MAX_PCM],
@@ -88,6 +94,13 @@ impl Playback {
     }
 
     pub(super) fn guest_name(&self) -> &str {
+        if self.jack.is_some() {
+            return if self.outputs.is_empty() {
+                "Headphones (3.5 mm)"
+            } else {
+                "Stela Audio"
+            };
+        }
         if self.outputs.len() == 1
             && let Some(name) = self.outputs[0].device.product_name()
         {
@@ -98,12 +111,27 @@ impl Playback {
 
     fn again(&mut self, now: u64, millis: u64) {
         self.next = now + host::COUNTER_HZ / 1000 * millis;
-        NEXT.store(if self.running { self.next } else { 0 }, Ordering::Relaxed);
+        let running = self.running || self.jack.as_ref().is_some_and(JackPlayback::running);
+        NEXT.store(if running { self.next } else { 0 }, Ordering::Relaxed);
     }
 
     pub(super) fn step(&mut self, root: u64, board: &Board, boot: bool) {
         let now = host::fresh_counter();
         if now < self.next {
+            return;
+        }
+        if let Some(jack) = &mut self.jack {
+            // Native HDA control commands are kept on the boot processor.
+            if !boot {
+                return;
+            }
+            if jack.step(root, board, now) {
+                let delay = if jack.running() { 2 } else { 4 };
+                self.again(now, delay);
+                return;
+            }
+            self.jack = None;
+            self.again(now, 4);
             return;
         }
         let Some(output) = self.outputs.front_mut() else {
@@ -246,12 +274,15 @@ impl Playback {
 
     pub(super) fn stop(&mut self, root: u64) {
         NEXT.store(0, Ordering::Relaxed);
-        if self.outputs.is_empty() {
+        if self.jack.is_none() && self.outputs.is_empty() {
             return;
         }
         // SAFETY: the service is stopping, with no host driver guard held
         // and the same live loader root as its normal work.
         let _root = unsafe { RestoreRoot::enter(root) };
+        if let Some(mut jack) = self.jack.take() {
+            jack.stop();
+        }
         if self.running
             && let Some(output) = self.outputs.front_mut()
         {

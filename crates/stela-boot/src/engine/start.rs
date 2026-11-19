@@ -3212,6 +3212,7 @@ fn start_devices(
             let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
             let device_skips = handoff.device_skips;
             let device_needs = handoff.device_needs;
+            let analog_audio = options.boots_macos();
             // Each PCI function's start has its own budget
             // (`stela_drivers::probe::DEVICE_START_US`) and is given up past
             // it; this whole bound only catches a stall outside every
@@ -3243,6 +3244,7 @@ fn start_devices(
                             log: log_partition,
                             fdr: fdr_partition,
                             usb_disks: &owned_usb,
+                            analog_audio,
                             wifi: owned_wifi.as_ref(),
                             external,
                             boot_disk: boot_disk.as_deref(),

@@ -38,7 +38,7 @@ use stela_drivers::{
         },
     },
     input::InputDevice,
-    probe::native::usb4,
+    probe::native::{hda, usb4},
     usb::{
         audio::UsbAudio,
         storage::UsbStorage,
@@ -189,6 +189,7 @@ impl HostUsb {
         usb4: Vec<usb4::Host>,
         storage: Vec<UsbStorage>,
         audio: Vec<UsbAudio>,
+        hda: Vec<hda::Host>,
         dma: RegionAllocator,
         firmware: &'static Requests,
         root: u64,
@@ -219,7 +220,7 @@ impl HostUsb {
             root,
             kept: Vec::new(),
             _storage: storage,
-            audio: playback::Playback::select(audio),
+            audio: playback::Playback::select(audio, hda),
             timer: PollTimer::new(tsc_hz / POLL_HZ, super::host::rdtsc()),
             split: Split::new(PIECE_NAMES),
         }

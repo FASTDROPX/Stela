@@ -12,7 +12,7 @@ pub struct RefilledPeriod {
     pub ring_offset: usize,
     pub bytes: usize,
 }
-pub(super) struct Progress {
+pub(in crate::hda) struct Progress {
     period: usize,
     ring: usize,
     guard: u64,
@@ -46,7 +46,12 @@ impl Progress {
             time: now,
         })
     }
-    fn observe(&mut self, position: u32, ioc: bool, now: u64) -> Result<(), Error> {
+    pub(in crate::hda) fn observe(
+        &mut self,
+        position: u32,
+        ioc: bool,
+        now: u64,
+    ) -> Result<(), Error> {
         let elapsed = now.wrapping_sub(self.time);
         // Refuse ambiguous full laps using an independent monotonic clock.
         // This is conservative if the device temporarily stalled.
@@ -85,6 +90,31 @@ impl Progress {
         }
         Ok(self.completed >= self.refilled + self.period as u64)
     }
+
+    pub(in crate::hda) fn next_period(&self) -> Result<Option<RefilledPeriod>, Error> {
+        Ok(self.reusable()?.then(|| RefilledPeriod {
+            sequence: self.refilled / self.period as u64,
+            ring_offset: (self.refilled % self.ring as u64) as usize,
+            bytes: self.period,
+        }))
+    }
+
+    pub(in crate::hda) fn commit(&mut self) -> Result<(), Error> {
+        if !self.reusable()? {
+            return Err(Error::PlaybackUnderrun);
+        }
+        let refilled = self
+            .refilled
+            .checked_add(self.period as u64)
+            .ok_or(Error::PlaybackUnderrun)?;
+        let submitted = self
+            .submitted
+            .checked_add(self.period as u64)
+            .ok_or(Error::PlaybackUnderrun)?;
+        self.refilled = refilled;
+        self.submitted = submitted;
+        Ok(())
+    }
 }
 impl<R: Registers, T: Timer> Controller<R, T> {
     pub(in crate::hda) fn hdmi_before_start(&mut self, id: StreamId) -> Result<(), Error> {
@@ -93,12 +123,27 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             return Ok(());
         };
         self.hdmi_runtime(id)?;
+        let progress = self.begin_period_playback(id)?;
+        self.hdmi_ports[index]
+            .as_mut()
+            .unwrap()
+            .route
+            .as_mut()
+            .unwrap()
+            .progress = Some(progress);
+        Ok(())
+    }
+
+    pub(in crate::hda) fn begin_period_playback(
+        &mut self,
+        id: StreamId,
+    ) -> Result<Progress, Error> {
         let stream = self.stream(id)?;
         let (period, ring, format, bdl) = (
             stream.period_bytes,
             stream.buffer.len(),
             stream.format,
-            stream._bdl.physical(),
+            stream._bdl.bus_address(),
         );
         let count = stream.bdl_entries;
         let base = stream_base(id.descriptor_index());
@@ -132,15 +177,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             u64::from(format.rate) * format.frame_bytes()? as u64,
             self.timer.now_us(),
         )?;
-        self.hdmi_ports[index]
-            .as_mut()
-            .unwrap()
-            .route
-            .as_mut()
-            .unwrap()
-            .progress = Some(progress);
         fence(Ordering::SeqCst);
-        Ok(())
+        Ok(progress)
     }
     pub(in crate::hda) fn hdmi_progress(
         &mut self,
@@ -205,21 +243,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .progress
             .as_ref()
             .ok_or(Error::StreamStopped)?;
-        if !progress.reusable()? {
+        let Some(refill) = progress.next_period()? else {
             return Ok(None);
-        }
-        let start = (progress.refilled % progress.ring as u64) as usize;
-        let sequence = progress.refilled / period as u64;
+        };
         // Checked aligned volatile words, not a mutable slice alias over active
         // device RAM. Controller::new's coherent RAM grant is mandatory.
-        for (word, bytes) in pcm.as_chunks::<4>().0.iter().enumerate() {
-            self.streams[usize::from(id.descriptor_index())]
-                .as_mut()
-                .unwrap()
-                .buffer
-                .write(start + word * 4, u32::from_le_bytes(*bytes).to_le());
-        }
-        fence(Ordering::SeqCst);
+        self.write_completed_period(id, refill.ring_offset, pcm);
         self.status(id)?;
         let progress = self.hdmi_ports[index]
             .as_mut()
@@ -230,7 +259,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .progress
             .as_mut()
             .unwrap();
-        if let Err(error) = progress.reusable() {
+        if let Err(error) = progress.commit() {
             self.hdmi_record(index, error);
             if let Err(cleanup) = self.hdmi_close_index(index) {
                 self.routing_failed = true;
@@ -238,19 +267,23 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             return Err(error);
         }
-        progress.refilled = progress
-            .refilled
-            .checked_add(period as u64)
-            .ok_or(Error::PlaybackUnderrun)?;
-        progress.submitted = progress
-            .submitted
-            .checked_add(period as u64)
-            .ok_or(Error::PlaybackUnderrun)?;
-        Ok(Some(RefilledPeriod {
-            sequence,
-            ring_offset: start,
-            bytes: period,
-        }))
+        Ok(Some(refill))
+    }
+
+    pub(in crate::hda) fn write_completed_period(
+        &mut self,
+        id: StreamId,
+        offset: usize,
+        pcm: &[u8],
+    ) {
+        let buffer = &mut self.streams[usize::from(id.descriptor_index())]
+            .as_mut()
+            .unwrap()
+            .buffer;
+        for (word, bytes) in pcm.as_chunks::<4>().0.iter().enumerate() {
+            buffer.write(offset + word * 4, u32::from_le_bytes(*bytes).to_le());
+        }
+        fence(Ordering::SeqCst);
     }
 }
 #[cfg(test)]

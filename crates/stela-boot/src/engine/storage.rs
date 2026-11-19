@@ -1785,6 +1785,8 @@ pub struct Selection<'a> {
     pub fdr: Option<Guid>,
     /// Whole USB disks for the guest, by serial number.
     pub usb_disks: &'a [String],
+    /// Route host audio only when starting the installed guest.
+    pub analog_audio: bool,
     /// The Wi-Fi network to join; without one a Wi-Fi adapter stays down.
     pub wifi: Option<&'a stela_drivers::net::wifi::network::Network>,
     /// With `--external-disks`, the guest hub's free ports, which every disk
@@ -1830,6 +1832,7 @@ pub unsafe fn open(
         log,
         fdr,
         usb_disks,
+        analog_audio,
         wifi,
         external,
         boot_disk,
@@ -1911,9 +1914,6 @@ pub unsafe fn open(
             ));
         }
     }
-    // HD Audio controllers stay attached for the boot; no guest audio device
-    // consumes them yet.
-    Vec::leak(core::mem::take(&mut devices.hda_hosts));
     // A USB device can connect, train its link and answer its first
     // commands after its controller's start looked at the ports: the
     // partitions this boot needs are waited for while the USB hosts report
@@ -2180,11 +2180,19 @@ pub unsafe fn open(
         devices: core::mem::take(&mut devices.nics),
         root,
     };
+    let hda = core::mem::take(&mut devices.hda_hosts);
+    let hda = if analog_audio {
+        hda
+    } else {
+        Vec::leak(hda);
+        Vec::new()
+    };
     let usb = super::usb::HostUsb::new(
         core::mem::take(&mut devices.usb_hosts),
         core::mem::take(&mut devices.usb4_hosts),
         core::mem::take(&mut devices.usb_storage),
         core::mem::take(&mut devices.audio),
+        hda,
         dma,
         firmware,
         root,

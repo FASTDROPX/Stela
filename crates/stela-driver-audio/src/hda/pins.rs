@@ -197,6 +197,42 @@ pub struct PinSense {
     pub impedance_code: Option<u32>,
 }
 impl<R: Registers, T: Timer> Controller<R, T> {
+    /// The first firmware-described 3.5 mm headphone or line-out route
+    /// whose pin reports a connected plug. An unobservable pin is ineligible.
+    pub fn connected_output_jack(
+        &mut self,
+        graph: &CodecGraph,
+        format: PcmFormat,
+    ) -> Result<Option<AnalogEndpoint>, Error> {
+        let endpoints = match graph.analog_endpoints(Direction::Playback, format) {
+            Ok(endpoints) => endpoints,
+            Err(Error::UnsupportedTopology) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut last_pin = None;
+        for endpoint in endpoints {
+            let pin = endpoint.route.pin();
+            let config = endpoint.configuration;
+            if config.connector() != 1
+                || config.no_presence_detection()
+                || !matches!(
+                    config.connection(),
+                    PinConnection::Jack | PinConnection::JackAndFixed
+                )
+                || !matches!(config.device(), PinDevice::Headphone | PinDevice::LineOut)
+                || last_pin == Some(pin)
+            {
+                continue;
+            }
+            match self.poll_pin_sense(graph, pin) {
+                Ok(sense) if sense.present && sense.raw != u32::MAX => return Ok(Some(endpoint)),
+                Ok(_) | Err(Error::UnsupportedTopology) => last_pin = Some(pin),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
     /// Standard polling works without unsolicited interrupts. Trigger-required
     /// pins receive SET_PIN_SENSE before GET_PIN_SENSE, as in jack.c. Managed
     /// SigmaTel codecs keep no-trigger sense; IDT83xxx also synchronizes its

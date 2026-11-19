@@ -105,6 +105,95 @@ fn pin_sense_preserves_routing() {
 }
 
 #[test]
+fn a_connected_jack_grants_analog_playback_and_completed_periods_are_refilled() {
+    let mut fixture = Fixture::new();
+    let model = realtek_headphone_model(0x10ec_0897, false);
+    let mut controller = create(&model, &mut fixture, config()).unwrap();
+    let graph = controller.enumerate_codec(0).unwrap();
+    assert!(
+        controller
+            .connected_output_jack(&graph, stereo())
+            .unwrap()
+            .is_none()
+    );
+    model.borrow_mut().pin_senses.insert(4, u32::MAX);
+    assert!(
+        controller
+            .connected_output_jack(&graph, stereo())
+            .unwrap()
+            .is_none()
+    );
+    model.borrow_mut().pin_senses.insert(4, 1 << 31);
+    let jack = controller
+        .connected_output_jack(&graph, stereo())
+        .unwrap()
+        .unwrap();
+    assert_eq!(jack.configuration.device(), PinDevice::Headphone);
+    assert_eq!(jack.route.pin(), 4);
+
+    const PERIOD: usize = 1536;
+    let id = controller
+        .allocate_stream(
+            Direction::Playback,
+            stereo(),
+            PERIOD,
+            4,
+            &mut fixture.allocator,
+        )
+        .unwrap();
+    let silence = [0; PERIOD * 4];
+    let pcm = [42; PERIOD];
+    assert_eq!(
+        controller.start_analog_playback(id, &silence),
+        Err(Error::UnsupportedTopology)
+    );
+    controller
+        .configure_analog_route(
+            &graph,
+            &jack.route,
+            id,
+            0,
+            PinOptions::Playback {
+                headphone: true,
+                eapd: None,
+            },
+        )
+        .unwrap();
+    controller.start_analog_playback(id, &silence).unwrap();
+    assert_eq!(controller.refill_analog_period(id, &pcm).unwrap(), None);
+    let base = stream_base(id.descriptor_index());
+    advance(&model, 8_000);
+    {
+        let mut hardware = model.borrow_mut();
+        hardware.set(base + SD_LPIB, PERIOD as u32, 4);
+        hardware.set(base + SD_STS, u32::from(SD_COMPLETE), 1);
+    }
+    let refill = controller.refill_analog_period(id, &pcm).unwrap().unwrap();
+    assert_eq!(
+        (refill.sequence, refill.ring_offset, refill.bytes),
+        (0, 0, PERIOD)
+    );
+    assert_eq!(
+        &controller.stream(id).unwrap().buffer.bytes()[..PERIOD],
+        &pcm
+    );
+
+    advance(&model, 40_000);
+    assert_eq!(
+        controller.refill_analog_period(id, &pcm),
+        Err(Error::PlaybackUnderrun)
+    );
+    assert!(!controller.status(id).unwrap().running);
+    model.borrow_mut().pin_senses.insert(4, 0);
+    assert!(
+        controller
+            .connected_output_jack(&graph, stereo())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn analog_duplex_routing() {
     let mut fixture = Fixture::new();
     let model = analog_model();
