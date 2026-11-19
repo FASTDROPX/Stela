@@ -81,7 +81,8 @@ impl Arena {
 pub struct Native {
     shared: Shared,
     id: SlotId,
-    name: Option<String>,
+    name: String,
+    location: String,
     time: NativeTime,
     playback: Arena,
     capture: Arena,
@@ -212,8 +213,12 @@ impl Transport for Native {
 /// Native playback/capture owner published by xHCI and kept in probe::Devices.
 pub type UsbAudio = AudioDevice<Native>;
 impl UsbAudio {
-    pub fn product_name(&self) -> Option<&str> {
-        self.transport.name.as_deref()
+    pub fn product_name(&self) -> &str {
+        &self.transport.name
+    }
+
+    pub fn location(&self) -> &str {
+        &self.transport.location
     }
 
     pub(crate) fn attach(
@@ -242,12 +247,8 @@ impl UsbAudio {
         let native = Native {
             shared,
             id: device.id,
-            name: device
-                .product
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(String::from),
+            location: device.location.clone(),
+            name: device.name(),
             time,
             playback: Arena::new(dma)?,
             capture: Arena::new(dma)?,
@@ -353,7 +354,8 @@ pub(crate) mod tests {
             let mut native = Native {
                 shared: shared.clone(),
                 id: shared.borrow().test_device_id(1).unwrap(),
-                name: None,
+                name: String::new(),
+                location: String::new(),
                 time: NativeTime::new(shared.borrow().clock).unwrap(),
                 playback: Arena::new(&mut dma).unwrap(),
                 capture: Arena::new(&mut dma).unwrap(),

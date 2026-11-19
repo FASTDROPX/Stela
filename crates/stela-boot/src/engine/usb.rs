@@ -189,6 +189,7 @@ impl HostUsb {
         usb4: Vec<usb4::Host>,
         storage: Vec<UsbStorage>,
         audio: Vec<UsbAudio>,
+        audio_inventory: &[xhci::Device],
         dma: RegionAllocator,
         firmware: &'static Requests,
         root: u64,
@@ -219,14 +220,14 @@ impl HostUsb {
             root,
             kept: Vec::new(),
             _storage: storage,
-            audio: playback::Playback::select(audio),
+            audio: playback::Playback::select(audio, audio_inventory),
             timer: PollTimer::new(tsc_hz / POLL_HZ, super::host::rdtsc()),
             split: Split::new(PIECE_NAMES),
         }
     }
 
     pub(super) fn audio_name(&self) -> Option<&str> {
-        self.audio.as_ref().map(playback::Playback::guest_name)
+        self.audio.as_ref().and_then(playback::Playback::guest_name)
     }
 
     pub(super) fn step_audio(&mut self, board: &super::parallel::Board, boot: bool) {

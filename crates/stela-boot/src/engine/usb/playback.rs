@@ -72,8 +72,41 @@ impl Output {
 impl Playback {
     /// Called while the host driver root is active, so incompatible owners
     /// drop with their controller and DMA storage mapped.
-    pub(super) fn select(devices: Vec<UsbAudio>) -> Option<Self> {
-        let outputs: VecDeque<_> = devices.into_iter().filter_map(Output::of).collect();
+    pub(super) fn select(
+        devices: Vec<UsbAudio>,
+        inventory: &[stela_drivers::usb::xhci::Device],
+    ) -> Option<Self> {
+        let mut outputs: VecDeque<_> = devices.into_iter().filter_map(Output::of).collect();
+        let selected = outputs.front().map(|output| output.device.location());
+        for device in inventory.iter().filter(|device| {
+            device.configurations.iter().any(|configuration| {
+                stela_drivers::usb::descriptor::interfaces(configuration)
+                    .iter()
+                    .any(|interface| interface.class == 1 && matches!(interface.subclass, 1 | 2))
+            })
+        }) {
+            let status = if selected == Some(device.location.as_str()) {
+                " (selected)"
+            } else if outputs
+                .iter()
+                .any(|output| output.device.location() == device.location)
+            {
+                " (compatible USB)"
+            } else {
+                " (not supported)"
+            };
+            output::arguments(format_args!(
+                "AUDIO OUTPUT {}{status}\n",
+                device.name().escape_debug()
+            ));
+        }
+        if let Some(primary) = outputs.pop_front() {
+            let name = primary.device.product_name();
+            // A fallback with another name would leave the guest's existing
+            // USB product descriptor pointing at the wrong hardware.
+            outputs.retain(|output| output.device.product_name() == name);
+            outputs.push_front(primary);
+        }
         (!outputs.is_empty()).then(|| Self {
             outputs,
             samples: vec![[0; 2]; TARGET + 1],
@@ -87,13 +120,10 @@ impl Playback {
         })
     }
 
-    pub(super) fn guest_name(&self) -> &str {
-        if self.outputs.len() == 1
-            && let Some(name) = self.outputs[0].device.product_name()
-        {
-            return name;
-        }
-        stela_soc::usb::audio::DEFAULT_NAME
+    pub(super) fn guest_name(&self) -> Option<&str> {
+        self.outputs
+            .front()
+            .map(|output| output.device.product_name())
     }
 
     fn again(&mut self, now: u64, millis: u64) {
@@ -200,9 +230,7 @@ impl Playback {
         let bits = output.format.sample_bytes() * 8;
         let failed = !matches!(result, Ok(()) | Err(Error::Underrun));
         let name = (failed || (self.running && !self.reported))
-            .then(|| output.device.product_name())
-            .flatten()
-            .map(alloc::string::String::from);
+            .then(|| alloc::string::String::from(output.device.product_name()));
         if failed {
             // Owners may need mapped controller registers while dropping.
             drop(self.outputs.pop_front());
