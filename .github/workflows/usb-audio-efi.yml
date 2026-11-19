@@ -1,4 +1,5 @@
 # Build the experimental EFI with the upstream release recipe.
+# Existing macOS installs can test USB audio without packaging Stela.app.
 # This workflow only uploads a test artifact.
 name: USB audio test image
 
@@ -16,33 +17,9 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  APP: guest/stela-app
 
 jobs:
-  app:
-    runs-on: macos-26
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build Stela.app
-        run: |
-          swift --version
-          # build.sh prints the bundle's path last.
-          app="$(bash "$APP/build.sh" | tee /dev/stderr | tail -1)"
-          [[ -f "$app/Contents/Info.plist" ]] || { echo "::error::$APP/build.sh named no app bundle: $app"; exit 1; }
-          # tar keeps the bundle's modes and code signature byte for byte.
-          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: stela-app
-          path: Stela.app.tar
-          if-no-files-found: error
-          retention-days: 7
-
   efi:
-    needs: app
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
@@ -116,16 +93,6 @@ jobs:
         with:
           path: target/gpu
           key: nvk-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse', '.github/spirv.sh') }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: stela-app
-          path: app
-
-      - name: Unpack Stela.app
-        run: |
-          tar -C app -xf app/Stela.app.tar
-          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
 
       - name: Fetch upstream sources
         run: cargo xtask gpu fetch
